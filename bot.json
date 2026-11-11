@@ -1,0 +1,18 @@
+{
+  "name": "My robot",
+  "language": "erlang",
+  "entry": "bot.erl",
+  "protocol": 2,
+  "supportedModes": [
+    "2d",
+    "3d"
+  ],
+  "supportedRulesets": [
+    "classic",
+    "inertial-2d",
+    "gravity-flat",
+    "gravity-hills",
+    "zero-g"
+  ],
+  "module": "bot"
+}
