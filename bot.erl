@@ -43,6 +43,7 @@
 %% Manual: https://clunkyard.com/manual#sdk
 -module(bot).
 -export([start/0,on_start/1,on_turn/2]).
+-define(U64,16#FFFFFFFFFFFFFFFF).
 start()->clunkyard:run(?MODULE),halt().
 on_start(R)->clunkyard:match_is_3d(R) andalso maps:get(z,clunkyard:arena_gravity(R))==0.
 clamp(Value)->clunkyard:angles_clamp(Value,-1,1).
@@ -95,4 +96,13 @@ on_turn(R,Free)->
                 clunkyard:drive_set(R,#{throttle=>0.8,turn=>clamp(clunkyard:angles_angle_diff(clunkyard:angles_bearing_to(Position,Centre),Heading)/30),pitch_turn=>clamp((Climb-Pitch)/30)});
             false->ok end
     end,
+    %% The arena's rate calibration, xorshift-sqrt v1; safe to delete.
+    case clunkyard:raw_number(R,<<"state.calibration.work">>) of
+        Work when is_number(Work),Work>0->clunkyard:status_set(R,#{text=><<"WORK">>,value=>calibration_work(trunc(Work),88172645463325252 bxor clunkyard:clock_tick(R),0.0)});
+        _->ok
+    end,
     Free.
+calibration_work(0,X,Sum)->(floor(Sum)+(X bsr 40)) rem 1000000;
+calibration_work(N,X0,Sum)->
+    X1=X0 bxor ((X0 bsl 13) band ?U64),X2=X1 bxor (X1 bsr 7),X3=X2 bxor ((X2 bsl 17) band ?U64),
+    calibration_work(N-1,X3,Sum+math:sqrt(X3 bsr 11)).
