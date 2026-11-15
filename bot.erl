@@ -1,5 +1,9 @@
 %% An Erlang robot on the core binding supplied by the arena.
-%% Precise contacts lead shots; remembered passive cues guide the search.
+%% Contacts narrow the beam and lead shots from a line fitted through recent
+%% sightings; remembered passive cues guide the search.
+%% Bearing is earned: a scan contact's bearing is off by up to its
+%% bearing_error (degrees, a fixed share of the arc), so a wide beam finds a
+%% robot and a narrow one aims at it. Contacts within 120 units are exact.
 %% Clunkyard robot API 2.0.0: one core under every language, the same
 %% answers everywhere. Facts (a call shows its arguments):
 %% match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -45,53 +49,111 @@
 %% Manual: https://clunkyard.com/manual#sdk
 -module(bot).
 -export([start/0,on_start/1,on_turn/2]).
+-define(SEARCH_ARC,40).  %% degrees: sweeps the circle in half a second
+-define(HOLD_WIDTH,60).  %% units across at the target: it stays in the beam from tick to tick
+-define(MIN_ARC,6).      %% degrees: the narrowest the beam holds
+-define(WINDOW,12).      %% ticks of sightings the aim averages
+-define(SIGHTINGS,8).    %% narrow sightings in the window before a shot
+-define(LOOK_EVERY,40).  %% ticks between looks around the target, for a nearer robot
+-define(REACQUIRE,10).   %% ticks to look again where a lost target was
 start()->clunkyard:run(?MODULE),halt().
 on_start(R)->
     Free=clunkyard:match_is_3d(R) andalso maps:get(z,clunkyard:arena_gravity(R))==0,
-    #{free=>Free,dodges=>0,dodge_end=>0}.
+    #{free=>Free,dodges=>0,dodge_end=>0,slot=>0}.
 clamp(Value)->clunkyard:angles_clamp(Value,-1,1).
 steer(Towards,Current)->clamp(clunkyard:angles_angle_diff(Towards,Current)/45).
-on_turn(R,#{free:=Free}=Memory)->
-    Position=clunkyard:me_position(R),Heading=clunkyard:me_heading(R),Pitch=clunkyard:me_pitch(R),
+%% A straight line through the narrowest of the last WINDOW ticks' sightings:
+%% where the robot is now, how fast it moves, and how many sightings it rests
+%% on. Each sighting is off by its bearing_error; the line averages that out.
+fit(R,Slot,Tick)->
+    Recent=[S||S<-clunkyard:tracker_history(R,Slot),maps:get(tick,S)>Tick-?WINDOW],
+    fit(R,Tick,Recent,length(Recent)).
+fit(_,_,_,N) when N<2->none;
+fit(R,Tick,Recent,_)->
+    Best=lists:min([maps:get(bearing_error,S)||S<-Recent]),
+    Seen=[S||S<-Recent,maps:get(bearing_error,S)=<1.5*Best],N=length(Seen),
+    case N<2 of
+        true->none;
+        false->
+            T0=lists:sum([maps:get(tick,S)||S<-Seen])/N,
+            Spread=lists:sum([math:pow(maps:get(tick,S)-T0,2)||S<-Seen]),
+            Line=fun(Axis)->
+                Mean=lists:sum([maps:get(Axis,maps:get(position,S))||S<-Seen])/N,
+                Slope=lists:sum([(maps:get(tick,S)-T0)*(maps:get(Axis,maps:get(position,S))-Mean)||S<-Seen])/Spread,
+                {Mean+Slope*(Tick-T0),Slope*clunkyard:match_tick_rate(R)}
+            end,
+            [{X,Vx},{Y,Vy},{Z,Vz}]=[Line(Axis)||Axis<-[x,y,z]],
+            {#{x=>X,y=>Y,z=>Z},#{x=>Vx,y=>Vy,z=>Vz},N}
+    end.
+on_turn(R,#{free:=Free,slot:=Slot}=Memory)->
+    Position=clunkyard:me_position(R),Heading=clunkyard:me_heading(R),Pitch=clunkyard:me_pitch(R),Tick=clunkyard:clock_tick(R),
     clunkyard:drive_forces(R,#{brake=>0.2}),
-    case {clunkyard:sensors_nearest(R),clunkyard:tracker_cue(R)} of
-        {undefined,undefined}->
-            Scan=clunkyard:scanner_last(R),Tick=clunkyard:clock_tick(R),
+    Nearest=clunkyard:sensors_nearest(R),
+    LastSeen=case Slot of 0->undefined;_->clunkyard:tracker_last_seen(R,Slot) end,
+    Lost=LastSeen=/=undefined andalso Tick-LastSeen=<?REACQUIRE,
+    Remembered=case Nearest of undefined->Slot;_->maps:get(slot,Nearest) end,
+    case {Nearest,Lost,clunkyard:tracker_cue(R)} of
+        {undefined,true,_}->
+            %% Lost it: look again where it was last seen, widening the beam, before searching.
+            Where=clunkyard:tracker_position(R,Slot),Bearing=clunkyard:angles_bearing_to(Position,Where),
+            Elevation=case Free of true->clunkyard:angles_elevation_to(Position,Where);false->0 end,
+            clunkyard:drive_set(R,#{throttle=>0.5,turn=>steer(Bearing,Heading),pitch_turn=>steer(Elevation,Pitch)}),
+            clunkyard:scanner_set(R,#{heading=>Bearing,arc=>min(?SEARCH_ARC,maps:get(arc,clunkyard:scanner_last(R))*2),pitch=>Elevation}),
+            clunkyard:status_set(R,#{text=><<"REACQUIRE">>});
+        {undefined,false,undefined}->
+            Scan=clunkyard:scanner_last(R),
             Up=case Free of true->((Tick div 10) rem 3-1)*35;false->0 end,
             clunkyard:drive_set(R,#{throttle=>0.5,turn=>0.33,pitch_turn=>steer(0,Pitch)}),
-            clunkyard:scanner_set(R,#{heading=>clunkyard:angles_normalize(maps:get(heading,Scan)+36),arc=>40,pitch=>Up}),
+            clunkyard:scanner_set(R,#{heading=>clunkyard:angles_normalize(maps:get(heading,Scan)+36),arc=>?SEARCH_ARC,pitch=>Up}),
             clunkyard:status_set(R,#{text=><<"SEARCH">>});
-        {undefined,Cue}->
+        {undefined,false,Cue}->
             Heard=maps:get(position,Cue),Bearing=clunkyard:angles_bearing_to(Position,Heard),
-            Distance=clunkyard:angles_distance(Position,Heard),Tick=clunkyard:clock_tick(R),
+            Distance=clunkyard:angles_distance(Position,Heard),
             Elevation=case Free of true->clunkyard:angles_elevation_to(Position,Heard);false->0 end,
             Error=min(maps:get(bearing_error,Cue),30),Across=(Tick rem 5-2)/2*Error,
             Up=case Free of true->((Tick div 5) rem 3-1)*Error/2;false->0 end,
             clunkyard:drive_set(R,#{throttle=>0.7,turn=>steer(Bearing,Heading),pitch_turn=>steer(Elevation,Pitch)}),
             clunkyard:scanner_set(R,#{heading=>Bearing+Across,arc=>clunkyard:scanner_arc_for_reach(R,Distance+100),pitch=>Elevation+Up}),
             clunkyard:status_set(R,#{text=><<"CUE">>,value=>Distance});
-        {Target,_}->
+        {Target,_,_}->
             Range=maps:get(range,Target),Bearing=maps:get(bearing,Target),Elevation=maps:get(elevation,Target),
             Throttle=if Range>350->0.7;Range<200->-0.4;true->0.2 end,
             clunkyard:drive_set(R,#{throttle=>Throttle,turn=>steer(Bearing,Heading),pitch_turn=>steer(Elevation,Pitch)}),
-            clunkyard:scanner_set(R,#{heading=>Bearing,arc=>20,pitch=>Elevation}),
-            %% gun_lead is the intercept if the target holds course.
+            %% Halve the beam each tick until it is HOLD_WIDTH across at the target:
+            %% narrow enough for a precise bearing, wide enough to keep it in.
+            Hold=max(?MIN_ARC,2*math:atan2(?HOLD_WIDTH/2,Range)*180/math:pi()),
+            %% In a crowd a narrow beam sees one robot. Every LOOK_EVERY ticks,
+            %% widen it for a tick: a nearer robot it finds becomes the target.
+            Arc=case Tick rem ?LOOK_EVERY of
+                0->?SEARCH_ARC;
+                _->max(Hold,min(?SEARCH_ARC,maps:get(arc,clunkyard:scanner_last(R))/2))
+            end,
+            clunkyard:scanner_set(R,#{heading=>Bearing,arc=>Arc,pitch=>Elevation}),
             Power=clunkyard:gun_power_for_flight_time(R,Range,1),
-            {AimHeading,AimPitch}=case clunkyard:gun_lead(R,Target,Power) of undefined->{Bearing,Elevation};Aim->{maps:get(heading,Aim),maps:get(pitch,Aim)}end,
+            %% An exact contact: gun_lead is the intercept if the target holds course.
+            %% A noisy one: lead the fitted line, and fire only once it rests on
+            %% enough sightings.
+            {Aim,Ready}=case maps:get(bearing_error,Target)>0 of
+                true->case fit(R,maps:get(slot,Target),Tick) of
+                    none->{undefined,false};
+                    {FitPosition,FitVelocity,Count}->{clunkyard:gun_lead_point(R,FitPosition,FitVelocity,Power),Count>=?SIGHTINGS}
+                end;
+                false->{clunkyard:gun_lead(R,Target,Power),true}
+            end,
+            {AimHeading,AimPitch}=case Aim of undefined->{Bearing,Elevation};_->{maps:get(heading,Aim),maps:get(pitch,Aim)}end,
             clunkyard:gun_aim(R,#{heading=>AimHeading,pitch=>AimPitch}),Now=clunkyard:gun_aim_now(R),
-            case abs(clunkyard:angles_angle_diff(AimHeading,maps:get(heading,Now)))<3 andalso abs(AimPitch-maps:get(pitch,Now))<3 andalso clunkyard:gun_can_fire(R,Power,10) of
+            case Ready andalso abs(clunkyard:angles_angle_diff(AimHeading,maps:get(heading,Now)))<3 andalso abs(AimPitch-maps:get(pitch,Now))<3 andalso clunkyard:gun_can_fire(R,Power,10) of
                 true->clunkyard:gun_fire(R,#{power=>Power});false->ok
             end,
-            clunkyard:status_set(R,#{text=><<"TRACK">>,value=>Range})
+            clunkyard:status_set(R,#{text=>case Ready of true-><<"TRACK">>;false-><<"NARROW">> end,value=>Range})
     end,
     %% A simple dodge: vary it, or predict the shooter.
-    Time=clunkyard:clock_tick(R),
     Flash=lists:any(fun(Contact)->maps:get(source,Contact)==<<"muzzle">> end,clunkyard:sensors_cues(R)),
-    Next=case Time>=maps:get(dodge_end,Memory) andalso Flash of
-        true->Memory#{dodges:=maps:get(dodges,Memory)+1,dodge_end:=Time+10};
-        false->Memory
+    Next=case Tick>=maps:get(dodge_end,Memory) andalso Flash of
+        true->Memory#{dodges:=maps:get(dodges,Memory)+1,dodge_end:=Tick+10,slot:=Remembered};
+        false->Memory#{slot:=Remembered}
     end,
-    case Time<maps:get(dodge_end,Next) of
+    case Tick<maps:get(dodge_end,Next) of
         true->
             %% Off the line of fire: left, then right next time (turn is positive left, strafe right).
             Left=maps:get(dodges,Next) rem 2==1,
