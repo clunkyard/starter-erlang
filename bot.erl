@@ -7,7 +7,8 @@
 %% clock: tick seconds remaining_ticks
 %% arena: size gravity terrain_kind ground_height(x y)
 %% me: health position velocity heading pitch roll angular_velocity
-%%   attitude grounded altitude applied
+%%   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+%%   from_mount(heading pitch) mount_toward(point)
 %% battery: charge capacity regen sustainable_drive compute
 %%   drive_cost(fraction)
 %% drive: hover_lift
@@ -29,7 +30,8 @@
 %% score: me best armour
 %% angles: normalize(degrees) angle_diff(target current)
 %%   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-%%   distance(a b) clamp(value low high)
+%%   distance(a b) to_chassis(heading pitch attitude)
+%%   from_chassis(heading pitch attitude) clamp(value low high)
 %% raw: number(path) text(path) has(path) flag(path) count(path) line()
 %% Controls: drive.set(throttle turn pitch_turn)
 %%   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -44,10 +46,12 @@
 -module(bot).
 -export([start/0,on_start/1,on_turn/2]).
 start()->clunkyard:run(?MODULE),halt().
-on_start(R)->clunkyard:match_is_3d(R) andalso maps:get(z,clunkyard:arena_gravity(R))==0.
+on_start(R)->
+    Free=clunkyard:match_is_3d(R) andalso maps:get(z,clunkyard:arena_gravity(R))==0,
+    #{free=>Free,dodges=>0,dodge_end=>0}.
 clamp(Value)->clunkyard:angles_clamp(Value,-1,1).
 steer(Towards,Current)->clamp(clunkyard:angles_angle_diff(Towards,Current)/45).
-on_turn(R,Free)->
+on_turn(R,#{free:=Free}=Memory)->
     Position=clunkyard:me_position(R),Heading=clunkyard:me_heading(R),Pitch=clunkyard:me_pitch(R),
     clunkyard:drive_forces(R,#{brake=>0.2}),
     case {clunkyard:sensors_nearest(R),clunkyard:tracker_cue(R)} of
@@ -71,6 +75,7 @@ on_turn(R,Free)->
             Throttle=if Range>350->0.7;Range<200->-0.4;true->0.2 end,
             clunkyard:drive_set(R,#{throttle=>Throttle,turn=>steer(Bearing,Heading),pitch_turn=>steer(Elevation,Pitch)}),
             clunkyard:scanner_set(R,#{heading=>Bearing,arc=>20,pitch=>Elevation}),
+            %% gun_lead is the intercept if the target holds course.
             Power=clunkyard:gun_power_for_flight_time(R,Range,1),
             {AimHeading,AimPitch}=case clunkyard:gun_lead(R,Target,Power) of undefined->{Bearing,Elevation};Aim->{maps:get(heading,Aim),maps:get(pitch,Aim)}end,
             clunkyard:gun_aim(R,#{heading=>AimHeading,pitch=>AimPitch}),Now=clunkyard:gun_aim_now(R),
@@ -78,6 +83,24 @@ on_turn(R,Free)->
                 true->clunkyard:gun_fire(R,#{power=>Power});false->ok
             end,
             clunkyard:status_set(R,#{text=><<"TRACK">>,value=>Range})
+    end,
+    %% A simple dodge: vary it, or predict the shooter.
+    Time=clunkyard:clock_tick(R),
+    Flash=lists:any(fun(Contact)->maps:get(source,Contact)==<<"muzzle">> end,clunkyard:sensors_cues(R)),
+    Next=case Time>=maps:get(dodge_end,Memory) andalso Flash of
+        true->Memory#{dodges:=maps:get(dodges,Memory)+1,dodge_end:=Time+10};
+        false->Memory
+    end,
+    case Time<maps:get(dodge_end,Next) of
+        true->
+            %% Off the line of fire: left, then right next time (turn is positive left, strafe right).
+            Left=maps:get(dodges,Next) rem 2==1,
+            case clunkyard:match_control(R) of
+                <<"forces">>->clunkyard:drive_set(R,#{throttle=>0.5}),clunkyard:drive_forces(R,#{strafe=>case Left of true->-1;false->1 end});
+                _->clunkyard:drive_set(R,#{throttle=>1,turn=>case Left of true->1;false->-1 end})
+            end,
+            clunkyard:status_set(R,#{text=>case Left of true-><<"dodge:left">>;false-><<"dodge:right">> end,value=>maps:get(dodges,Next)});
+        false->ok
     end,
     case clunkyard:battery_charge(R)<clunkyard:battery_capacity(R)/4 of
         true->clunkyard:drive_set(R,#{throttle=>clunkyard:drive_get(R,throttle)*0.5});false->ok
@@ -95,4 +118,4 @@ on_turn(R,Free)->
                 clunkyard:drive_set(R,#{throttle=>0.8,turn=>clamp(clunkyard:angles_angle_diff(clunkyard:angles_bearing_to(Position,Centre),Heading)/30),pitch_turn=>clamp((Climb-Pitch)/30)});
             false->ok end
     end,
-    Free.
+    Next.
